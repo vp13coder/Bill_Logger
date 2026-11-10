@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f766e">
+<title>Bill Logger</title>
+<style>
+:root{--bg:#f6f7f8;--card:#fff;--tx:#1b1f23;--mut:#667085;--ac:#0f766e;--bd:#e4e7ec;--wn:#fffbeb}
+@media(prefers-color-scheme:dark){:root{--bg:#121416;--card:#1c1f23;--tx:#eceff1;--mut:#98a2b3;--bd:#2d3238;--wn:#3b2f12}}
+*{box-sizing:border-box}body{margin:auto;font-family:system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:12px;max-width:640px}
+h1{font-size:20px;margin:6px 0 12px}.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:12px}
+button,.btn{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;display:block;text-align:center;margin-top:8px}
+.alt{background:transparent!important;color:var(--ac)!important;border:1px solid var(--ac)!important}
+label{font-size:13px;color:var(--mut);display:block;margin-top:10px}
+input,select{width:100%;padding:10px;border:1px solid var(--bd);border-radius:8px;font-size:16px;background:var(--bg);color:var(--tx)}
+input.warn{border-color:#d97706;background:var(--wn)}
+canvas{width:100%;border-radius:8px;touch-action:none;display:block}#st{font-size:14px;color:var(--mut);margin-top:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 4px;border-bottom:1px solid var(--bd);text-align:left}
+.sc{overflow-x:auto}.hide{display:none}small{color:var(--mut)}.x{background:none;color:#b42318;width:auto;padding:0 6px;margin:0;display:inline}
+</style></head><body>
+<h1>🧾 Bill Logger</h1>
+
+<div class="card">
+  <label class="btn" for="cam">📷 Take photo of bill</label>
+  <input id="cam" type="file" accept="image/*" capture="environment" class="hide">
+  <label class="btn alt" for="gal">🖼 Choose from gallery</label>
+  <input id="gal" type="file" accept="image/*" class="hide">
+  <div id="st"></div>
+</div>
+
+<div class="card hide" id="cropBox">
+  <small>Drag on the photo to draw a box around the receipt only (removes background text), then tap Read.</small>
+  <canvas id="cv"></canvas>
+  <button id="read">🔍 Read bill</button>
+  <button class="alt" id="resetCrop">Clear box (use whole photo)</button>
+</div>
+
+<div class="card hide" id="rev">
+  <label>Date</label><input id="fDate" type="date">
+  <label>Hotel / Restaurant name</label><input id="fName">
+  <label>Total amount (inclusive of tax)</label><input id="fTotal" inputmode="decimal">
+  <label>Customer TIN</label><input id="fTin" inputmode="numeric">
+  <label>Receipt verification code</label><input id="fCode" autocapitalize="characters">
+  <label>Sheet / template</label><select id="fTpl"></select>
+  <small>Bills from the same hotel (matched by its TIN) go to the same sheet automatically.</small>
+  <button id="save">Save to log</button>
+  <button class="alt" id="cancel">Discard</button>
+  <details style="margin-top:10px"><summary><small>Raw OCR text</small></summary><pre id="raw" style="white-space:pre-wrap;font-size:12px"></pre></details>
+</div>
+
+<div class="card">
+  <button id="xl">⬇ Download Excel (.xlsx)</button>
+  <div id="logs"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const KEY='billlog.v2';
+let db={tpls:{}};
+try{const s=JSON.parse(localStorage.getItem(KEY));if(s&&s.tpls)db=s}catch(e){}
+const persist=()=>{try{localStorage.setItem(KEY,JSON.stringify(db))}catch(e){}};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const pad=n=>String(n).padStart(2,'0');
+let worker=null,im=null,crop=null,drag=null,cur={};
+
+/* ---------- crop UI ---------- */
+const cv=$('cv'),cx=cv.getContext('2d');
+function draw(){
+  cx.drawImage(im,0,0,cv.width,cv.height);
+  if(crop){const{x,y,w,h}=crop;cx.fillStyle='rgba(0,0,0,.55)';
+    cx.fillRect(0,0,cv.width,y);cx.fillRect(0,y+h,cv.width,cv.height-y-h);cx.fillRect(0,y,x,h);cx.fillRect(x+w,y,cv.width-x-w,h);
+    cx.strokeStyle='#14b8a6';cx.lineWidth=4;cx.strokeRect(x,y,w,h);}
+}
+const pos=e=>{const r=cv.getBoundingClientRect();return[(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]};
+cv.onpointerdown=e=>{drag=pos(e);cv.setPointerCapture(e.pointerId)};
+cv.onpointermove=e=>{if(!drag)return;const[x,y]=pos(e);
+  crop={x:Math.min(drag[0],x),y:Math.min(drag[1],y),w:Math.abs(x-drag[0]),h:Math.abs(y-drag[1])};draw()};
+cv.onpointerup=()=>{drag=null;if(crop&&(crop.w<30||crop.h<30))crop=null;draw()};
+$('resetCrop').onclick=()=>{crop=null;draw()};
+function loadImage(f){
+  if(!f)return;const i=new Image();
+  i.onload=()=>{im=i;crop=null;cv.width=Math.min(900,i.naturalWidth);cv.height=Math.round(cv.width*i.naturalHeight/i.naturalWidth);
+    draw();$('rev').classList.add('hide');$('cropBox').classList.remove('hide');$('st').textContent='';$('cropBox').scrollIntoView({behavior:'smooth'})};
+  i.src=URL.createObjectURL(f);
+}
+$('cam').onchange=e=>{loadImage(e.target.files[0]);e.target.value=''};
+$('gal').onchange=e=>{loadImage(e.target.files[0]);e.target.value=''};
+
+/* ---------- image preprocessing ---------- */
+function prep(){
+  const s=im.naturalWidth/cv.width, c=crop||{x:0,y:0,w:cv.width,h:cv.height};
+  const sx=c.x*s,sy=c.y*s,sw=c.w*s,sh=c.h*s;
+  let k=Math.max(.5,Math.min(2.5,1800/sw,4500/sh));
+  const o=document.createElement('canvas');o.width=Math.round(sw*k);o.height=Math.round(sh*k);
+  const ox=o.getContext('2d');ox.drawImage(im,sx,sy,sw,sh,0,0,o.width,o.height);
+  const d=ox.getImageData(0,0,o.width,o.height),p=d.data,h=new Uint32Array(256);
+  for(let i=0;i<p.length;i+=4){const g=Math.round(.299*p[i]+.587*p[i+1]+.114*p[i+2]);p[i]=g;h[g]++}
+  const n=p.length/4;let a=0,lo=0,hi=255;
+  for(let v=0;v<256;v++){a+=h[v];if(a>n*.02){lo=v;break}}
+  a=0;for(let v=255;v>=0;v--){a+=h[v];if(a>n*.02){hi=v;break}}
+  const r=Math.max(1,hi-lo);
+  for(let i=0;i<p.length;i+=4){const g=Math.max(0,Math.min(255,(p[i]-lo)*255/r));p[i]=p[i+1]=p[i+2]=g;p[i+3]=255}
+  ox.putImageData(d,0,0);return o;
+}
+
+/* ---------- parsing (tuned for TRA EFD receipts) ---------- */
+const fixD=s=>s.replace(/[Oo]/g,'0').replace(/[Il|]/g,'1').replace(/S/g,'5').replace(/B/g,'8');
+function tin9(line){ // returns 9-digit TINs on a line, tolerating OCR letter/digit mix-ups
+  const out=[];
+  for(const m of line.matchAll(/(?<![\dA-Z])[\dOISB]{3}[-\s]?[\dOISB]{3}[-\s]?[\dOISB]{3}(?![\dA-Z])/g)){
+    if((m[0].match(/\d/g)||[]).length>=6)out.push(fixD(m[0]).replace(/\D/g,''));
+  }
+  return out;
+}
+function amountsIn(s){
+  s=s.replace(/[’'`´]/g,',').replace(/(\d)\.(\d{3})\.(\d{2})\b/g,'$1,$2.$3')
+     .replace(/(\d{1,3}) (\d{3}\.\d{2})\b/g,'$1,$2').replace(/(\d),(\d{2})(?!\d)/g,'$1.$2');
+  return (s.match(/\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?/g)||[]).map(x=>parseFloat(x.replace(/,/g,''))).filter(n=>n>0);
+}
+function parseDate(t){
+  t=t.replace(/(?<=\d)O|O(?=\d)/g,'0');let m;
+  if(m=t.match(/\b(\d{1,2})[-\/.](\d{1,2})[-\/.](20\d{2})\b/)){if(+m[2]<=12&&+m[1]<=31)return`${m[3]}-${pad(m[2])}-${pad(m[1])}`}
+  if(m=t.match(/\b(20\d{2})[-\/.](\d{1,2})[-\/.](\d{1,2})\b/))return`${m[1]}-${pad(m[2])}-${pad(m[3])}`;
+  return'';
+}
+const title=s=>s.toLowerCase().replace(/\b[a-z]/g,c=>c.toUpperCase());
+function parse(text){
+  const L=text.toUpperCase().split('\n').map(s=>s.trim()).filter(Boolean),r={};
+  // seller name: line right after "START OF LEGAL RECEIPT"
+  let nm='',i=L.findIndex(l=>/START\s*OF\s*LEGAL|LEGAL\s*RECEIPT/.test(l));
+  if(i>=0)for(let j=i+1;j<Math.min(L.length,i+4);j++)if(/[A-Z]{3,}/.test(L[j])&&!/P\.?\s*O\.?\s*BOX|\bTIN\b/.test(L[j])){nm=L[j];break}
+  if(!nm)nm=L.find(l=>/LIMITED|LTD|HOTEL|RESTAURANT|LODGE|CAFE|GRILL|KITCHEN/.test(l))||'';
+  r.name=title(nm.replace(/[^A-Z0-9 &'.-]/g,'').replace(/\s+/g,' ').trim());
+  // seller TIN (line with TIN, not the buyer's)
+  r.sellerTin='';
+  for(const l of L){if(/\bTIN\b/.test(l)&&!/CUSTOMER|BUYER/.test(l)){const t=tin9(l.slice(l.indexOf('TIN')+3));if(t.length){r.sellerTin=t[0];break}}}
+  // customer TIN: any 9-digit id between "CUSTOMER" and "RECEIPT NUMBER"/"DATE"
+  r.tin='';const ci=L.findIndex(l=>/CUSTOMER/.test(l));
+  if(ci>=0){let e=L.findIndex((l,k)=>k>ci&&/RECEIPT\s*(NUMBER|NO)|^DATE/.test(l));if(e<0)e=Math.min(L.length,ci+8);
+    for(let k=ci;k<=e;k++){const t=tin9(L[k].replace(/CUSTOMER\s*ID\s*TYPE|BUYER.S/g,'')).filter(x=>x!==r.sellerTin);if(t.length){r.tin=t[0];break}}}
+  // date
+  const dl=L.find(l=>/\bDATE\b/.test(l));r.date=(dl&&parseDate(dl))||parseDate(L.join('\n'));
+  // total (inclusive of tax); amount can be on the next line (large print)
+  const find=re=>{for(let k=0;k<L.length;k++){if(re.test(L[k])&&!/EXCLUSIVE|TOTAL\s*TAX/.test(L[k])){
+    for(let j=k;j<=Math.min(k+2,L.length-1);j++){const a=amountsIn(L[j]);if(a.length)return Math.max(...a)}}}return''};
+  r.total=find(/TOTAL\s*INCL/)||find(/GRAND\s*TOTAL|TOTAL\s*AMOUNT|AMOUNT\s*DUE|NET\s*AMOUNT|^TOTAL\b/)||find(/^(CASH|CARD|MOBILE|M-?PESA)/)
+    ||(()=>{const a=L.flatMap(amountsIn).filter(n=>n>=100&&n<1e8);return a.length?Math.max(...a):''})();
+  // receipt verification code (printed near the bottom, e.g. 8930E67811)
+  r.code='';const vk=L.findIndex(l=>/VERIFICATION\s*CODE/.test(l));
+  if(vk>=0)for(let j=vk;j<=Math.min(vk+2,L.length-1);j++){
+    const t=(j==vk?L[j].replace(/.*VERIFICATION\s*CODE/,''):L[j]).replace(/[^A-Z0-9]/g,'');
+    if(/^[A-Z0-9]{8,12}$/.test(t)&&/\d/.test(t)){r.code=t;break}}
+  return r;
+}
+
+/* ---------- templates / sheets ---------- */
+const tplKey=r=>r.sellerTin?'tin:'+r.sellerTin:'name:'+(r.name||'unknown').toLowerCase();
+function sheetName(n){
+  let b=(n||'Unknown').replace(/[\[\]:*?\/\\]/g,'').trim().slice(0,28)||'Unknown',s=b,i=2;
+  const used=Object.values(db.tpls).map(t=>t.sheet.toLowerCase());
+  while(used.includes(s.toLowerCase()))s=b+' '+i++;return s;
+}
+function fillTpl(sel){
+  let h='';
+  if(!db.tpls[cur.key])h+=`<option value="__auto">✚ New sheet: ${esc(cur.name||'Unknown')}</option>`;
+  h+=Object.entries(db.tpls).map(([k,t])=>`<option value="${esc(k)}">${esc(t.sheet)}</option>`).join('');
+  h+='<option value="__custom">✚ Other new sheet…</option>';
+  $('fTpl').innerHTML=h;$('fTpl').value=sel;
+}
+$('fTpl').onchange=()=>{if($('fTpl').value==='__custom'){
+  const n=(prompt('New sheet name')||'').trim();if(!n){fillTpl(db.tpls[cur.key]?cur.key:'__auto');return}
+  const o=document.createElement('option');o.value='__c:'+n;o.textContent='✚ New sheet: '+n;$('fTpl').prepend(o);$('fTpl').value=o.value}};
+
+/* ---------- read bill ---------- */
+$('read').onclick=async()=>{
+  $('st').textContent='Preparing image…';
+  try{
+    const c=prep();
+    if(!worker){worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')$('st').textContent='Reading bill… '+Math.round(m.progress*100)+'%';else if(m.status)$('st').textContent=m.status+'…'}});
+      await worker.setParameters({tessedit_pageseg_mode:'4',preserve_interword_spaces:'1'})}
+    const{data:{text}}=await worker.recognize(c);
+    const r=parse(text);cur={...r,key:tplKey(r)};
+    $('fDate').value=r.date;$('fName').value=r.name;$('fTotal').value=r.total;$('fTin').value=r.tin;$('fCode').value=r.code;
+    ['fDate','fName','fTotal','fTin'].forEach(id=>$(id).classList.toggle('warn',!$(id).value));
+    $('raw').textContent=text;fillTpl(db.tpls[cur.key]?cur.key:'__auto');
+    $('rev').classList.remove('hide');
+    $('st').textContent=['fDate','fName','fTotal','fTin'].some(id=>!$(id).value)?'Some fields (orange) could not be read — please fill them in.':'Check the details, then save.';
+    $('rev').scrollIntoView({behavior:'smooth'});
+  }catch(e){$('st').textContent='OCR failed: '+e.message+' (internet is needed on first use)'}
+};
+$('cancel').onclick=()=>{$('rev').classList.add('hide');$('st').textContent=''};
+$('save').onclick=()=>{
+  let v=$('fTpl').value,k=v;
+  if(v==='__auto'){k=cur.key;db.tpls[k]={sheet:sheetName($('fName').value),rows:[]}}
+  else if(v.startsWith('__c:')){const n=v.slice(4);k='custom:'+n.toLowerCase();if(!db.tpls[k])db.tpls[k]={sheet:sheetName(n),rows:[]}}
+  const row={date:$('fDate').value,name:$('fName').value.trim(),total:parseFloat($('fTotal').value)||0,tin:$('fTin').value.trim(),code:$('fCode').value.trim().toUpperCase(),stin:cur.sellerTin||'',added:Date.now()};
+  if(row.code&&Object.values(db.tpls).some(t=>t.rows.some(x=>x.code===row.code))&&!confirm('A bill with this verification code is already logged. Save again?'))return;
+  db.tpls[k].rows.push(row);persist();render();
+  $('rev').classList.add('hide');$('cropBox').classList.add('hide');$('st').textContent='Saved ✔ — scan the next bill.';
+};
+const sorted=rows=>[...rows].sort((a,b)=>(b.date||'').localeCompare(a.date||'')||b.added-a.added);
+window.del=(k,t)=>{if(!confirm('Delete this entry?'))return;db.tpls[k].rows=db.tpls[k].rows.filter(r=>r.added!==t);persist();render()};
+function render(){
+  const ks=Object.keys(db.tpls);
+  $('logs').innerHTML=ks.length?ks.map(k=>{const t=db.tpls[k];return`<h3 style="margin:14px 0 4px">${esc(t.sheet)} <small>(${t.rows.length})</small></h3><div class="sc"><table><tr><th>Date</th><th>Hotel</th><th>Total</th><th>Cust. TIN</th><th></th></tr>${
+    sorted(t.rows).map(r=>`<tr><td>${esc(r.date)}</td><td>${esc(r.name)}</td><td>${r.total.toLocaleString()}</td><td>${esc(r.tin)}</td><td><button class="x" onclick="del('${esc(k)}',${r.added})">✕</button></td></tr>`).join('')}</table></div>`}).join(''):'<small>No bills logged yet.</small>';
+}
+$('xl').onclick=()=>{
+  const ks=Object.keys(db.tpls).filter(k=>db.tpls[k].rows.length);if(!ks.length)return alert('Nothing to export yet.');
+  const wb=XLSX.utils.book_new();
+  ks.forEach(k=>{const t=db.tpls[k];
+    const ws=XLSX.utils.json_to_sheet(sorted(t.rows).map(r=>({'Date':r.date,'Hotel Name':r.name,'Total Amount':r.total,'Customer TIN':r.tin,'Verification Code':r.code})));
+    ws['!cols']=[{wch:12},{wch:30},{wch:16},{wch:16},{wch:14}];
+    t.rows.forEach((_,i)=>{const c=ws['C'+(i+2)];if(c)c.z='#,##0.00'});
+    XLSX.utils.book_append_sheet(wb,ws,t.sheet)});
+  XLSX.writeFile(wb,'bills-log.xlsx');
+};
+render();
+</script>
+</body></html>
